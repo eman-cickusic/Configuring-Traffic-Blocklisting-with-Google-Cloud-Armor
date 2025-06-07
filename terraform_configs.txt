@@ -1,0 +1,299 @@
+# Google Cloud Armor Traffic Blocklisting - Terraform Configuration
+# This configuration creates the infrastructure for testing Cloud Armor policies
+
+terraform {
+  required_version = ">= 1.0"
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 5.0"
+    }
+  }
+}
+
+# Configure the Google Cloud Provider
+provider "google" {
+  project = var.project_id
+  region  = var.region
+  zone    = var.zone
+}
+
+# Variables
+variable "project_id" {
+  description = "The GCP project ID"
+  type        = string
+}
+
+variable "region" {
+  description = "The GCP region"
+  type        = string
+  default     = "us-central1"
+}
+
+variable "zone" {
+  description = "The GCP zone"
+  type        = string
+  default     = "us-central1-a"
+}
+
+variable "vm_name" {
+  description = "Name of the test VM"
+  type        = string
+  default     = "access-test"
+}
+
+variable "policy_name" {
+  description = "Name of the Cloud Armor security policy"
+  type        = string
+  default     = "blocklist-access-test"
+}
+
+# Data sources to get existing load balancer components
+data "google_compute_backend_service" "web_backend" {
+  name = "web-backend"
+}
+
+data "google_compute_global_forwarding_rule" "web_rule" {
+  name = "web-rule"
+}
+
+# Create the test VM
+resource "google_compute_instance" "access_test" {
+  name         = var.vm_name
+  machine_type = "e2-micro"
+  zone         = var.zone
+
+  boot_disk {
+    initialize_params {
+      image = "debian-cloud/debian-11"
+      size  = 10
+      type  = "pd-standard"
+    }
+  }
+
+  network_interface {
+    network = "default"
+    access_config {
+      # Ephemeral external IP
+    }
+  }
+
+  tags = ["http-server", "https-server"]
+
+  metadata_startup_script = <<-EOF
+    #!/bin/bash
+    apt-get update
+    apt-get install -y curl wget
+    echo "VM setup complete" > /tmp/startup-complete
+  EOF
+
+  labels = {
+    purpose = "cloud-armor-testing"
+    project = "traffic-blocklisting"
+  }
+}
+
+# Create Cloud Armor security policy
+resource "google_compute_security_policy" "blocklist_policy" {
+  name        = var.policy_name
+  description = "Security policy to blocklist access-test VM"
+  type        = "CLOUD_ARMOR"
+
+  # Default rule - allow all traffic
+  rule {
+    action   = "allow"
+    priority = "2147483647"
+    match {
+      versioned_expr = "SRC_IPS_V1"
+      config {
+        src_ip_ranges = ["*"]
+      }
+    }
+    description = "Default allow rule"
+  }
+
+  # Rule to block the test VM
+  rule {
+    action   = "deny(404)"
+    priority = "1000"
+    match {
+      versioned_expr = "SRC_IPS_V1"
+      config {
+        src_ip_ranges = [google_compute_instance.access_test.network_interface[0].access_config[0].nat_ip]
+      }
+    }
+    description = "Block access-test VM IP: ${google_compute_instance.access_test.network_interface[0].access_config[0].nat_ip}"
+  }
+
+  # Optional: Add rate limiting rule
+  rule {
+    action   = "rate_based_ban"
+    priority = "2000"
+    match {
+      versioned_expr = "SRC_IPS_V1"
+      config {
+        src_ip_ranges = ["*"]
+      }
+    }
+    rate_limit_options {
+      conform_action = "allow"
+      exceed_action  = "deny(429)"
+      enforce_on_key = "IP"
+      rate_limit_threshold {
+        count        = 100
+        interval_sec = 60
+      }
+      ban_duration_sec = 300
+    }
+    description = "Rate limit: 100 requests per minute"
+  }
+}
+
+# Attach security policy to backend service
+resource "google_compute_backend_service_security_policy" "policy_attachment" {
+  backend_service = data.google_compute_backend_service.web_backend.name
+  security_policy = google_compute_security_policy.blocklist_policy.name
+}
+
+# Create firewall rule for health checks (if needed)
+resource "google_compute_firewall" "allow_health_check" {
+  name    = "allow-health-check-${var.vm_name}"
+  network = "default"
+
+  allow {
+    protocol = "tcp"
+    ports    = ["8080", "80"]
+  }
+
+  source_ranges = ["35.191.0.0/16", "130.211.0.0/22"]
+  target_tags   = ["http-server"]
+
+  description = "Allow health check traffic"
+}
+
+# Optional: Create additional security rules
+resource "google_compute_security_policy" "advanced_policy" {
+  count       = var.enable_advanced_rules ? 1 : 0
+  name        = "${var.policy_name}-advanced"
+  description = "Advanced security policy with multiple rules"
+  type        = "CLOUD_ARMOR"
+
+  # Default rule
+  rule {
+    action   = "allow"
+    priority = "2147483647"
+    match {
+      versioned_expr = "SRC_IPS_V1"
+      config {
+        src_ip_ranges = ["*"]
+      }
+    }
+    description = "Default allow rule"
+  }
+
+  # Geographic blocking
+  rule {
+    action   = "deny(403)"
+    priority = "1000"
+    match {
+      expr {
+        expression = "origin.region_code == 'CN' || origin.region_code == 'RU'"
+      }
+    }
+    description = "Block traffic from specific countries"
+  }
+
+  # Block suspicious user agents
+  rule {
+    action   = "deny(403)"
+    priority = "1100"
+    match {
+      expr {
+        expression = "has(request.headers['user-agent']) && request.headers['user-agent'].contains('bot')"
+      }
+    }
+    description = "Block bot traffic"
+  }
+
+  # Block large requests
+  rule {
+    action   = "deny(413)"
+    priority = "1200"
+    match {
+      expr {
+        expression = "int(request.headers['content-length']) > 1000000"
+      }
+    }
+    description = "Block requests larger than 1MB"
+  }
+}
+
+# Variable for advanced rules
+variable "enable_advanced_rules" {
+  description = "Enable advanced security rules"
+  type        = bool
+  default     = false
+}
+
+# Outputs
+output "load_balancer_ip" {
+  description = "Load balancer IP address"
+  value       = data.google_compute_global_forwarding_rule.web_rule.ip_address
+}
+
+output "test_vm_name" {
+  description = "Name of the test VM"
+  value       = google_compute_instance.access_test.name
+}
+
+output "test_vm_external_ip" {
+  description = "External IP of the test VM"
+  value       = google_compute_instance.access_test.network_interface[0].access_config[0].nat_ip
+}
+
+output "security_policy_name" {
+  description = "Name of the Cloud Armor security policy"
+  value       = google_compute_security_policy.blocklist_policy.name
+}
+
+output "security_policy_id" {
+  description = "ID of the Cloud Armor security policy"
+  value       = google_compute_security_policy.blocklist_policy.id
+}
+
+output "backend_service_name" {
+  description = "Name of the backend service"
+  value       = data.google_compute_backend_service.web_backend.name
+}
+
+# Local values for computed expressions
+locals {
+  test_commands = [
+    "# Test from blocked VM (should return 404):",
+    "gcloud compute ssh ${google_compute_instance.access_test.name} --zone=${var.zone} --command='curl -m1 ${data.google_compute_global_forwarding_rule.web_rule.ip_address}'",
+    "",
+    "# Test from local machine (should work):",
+    "curl -m1 ${data.google_compute_global_forwarding_rule.web_rule.ip_address}",
+    "",
+    "# View logs:",
+    "gcloud logging read \"resource.type=http_load_balancer AND jsonPayload.enforcedSecurityPolicy.name=${google_compute_security_policy.blocklist_policy.name}\" --limit=10"
+  ]
+}
+
+output "test_commands" {
+  description = "Commands to test the setup"
+  value       = join("\n", local.test_commands)
+}
+
+# Data source for project information
+data "google_project" "current" {}
+
+output "project_info" {
+  description = "Project information"
+  value = {
+    project_id     = data.google_project.current.project_id
+    project_number = data.google_project.current.number
+    region         = var.region
+    zone           = var.zone
+  }
+}
